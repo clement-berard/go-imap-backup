@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Array of source files to build (specify their paths relative to this script)
-SOURCE_FILES=("src/backup.go")
+SOURCE_FILES=("src/backup.go" "src/manage-duplicates.go")
 
 # Directory to store the compiled binaries
 OUTPUT_DIR="builds"
