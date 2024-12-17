@@ -2,11 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -17,7 +17,6 @@ import (
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
-	"github.com/emersion/go-message/mail"
 	"github.com/joho/godotenv"
 )
 
@@ -28,6 +27,7 @@ type EmailInfo struct {
 	Date     time.Time
 	Size     uint32
 	Hash     string
+	Content  string
 }
 
 type DuplicateGroup struct {
@@ -36,8 +36,8 @@ type DuplicateGroup struct {
 }
 
 type IMAPManager struct {
-	client     *client.Client
-	trashbox   string
+	client      *client.Client
+	targetFolder string
 }
 
 func connectIMAP() (*IMAPManager, error) {
@@ -45,6 +45,7 @@ func connectIMAP() (*IMAPManager, error) {
 	port := os.Getenv("IMAP_PORT")
 	user := os.Getenv("IMAP_USER")
 	pass := os.Getenv("IMAP_PASSWORD")
+	targetFolder := os.Getenv("TARGET_FOLDER")
 
 	addr := fmt.Sprintf("%s:%s", host, port)
 	log.Printf("Connecting to %s...", addr)
@@ -59,79 +60,10 @@ func connectIMAP() (*IMAPManager, error) {
 	}
 	log.Printf("Connected as %s", user)
 
-	// Find trash folder
-	mailboxes := make(chan *imap.MailboxInfo)
-	done := make(chan error, 1)
-	go func() {
-		done <- c.List("", "*", mailboxes)
-	}()
-
-	trashbox := ""
-	trashNames := []string{"Trash", "TRASH", "Corbeille", "Deleted Items", "[Gmail]/Trash", "[Google Mail]/Trash"}
-	for m := range mailboxes {
-		for _, t := range trashNames {
-			if strings.EqualFold(m.Name, t) {
-				trashbox = m.Name
-				break
-			}
-		}
-	}
-
-	if err := <-done; err != nil {
-		return nil, fmt.Errorf("error listing mailboxes: %v", err)
-	}
-
-	if trashbox == "" {
-		return nil, fmt.Errorf("could not find trash folder")
-	}
-
 	return &IMAPManager{
-		client:   c,
-		trashbox: trashbox,
+		client: c,
+		targetFolder: targetFolder,
 	}, nil
-}
-
-func computeEmailHash(msg *mail.Reader) (string, error) {
-	h := sha256.New()
-
-	// Parse header for relevant fields
-	header := msg.Header
-	if subject := header.Get("Subject"); subject != "" {
-		h.Write([]byte(subject))
-	}
-	if date := header.Get("Date"); date != "" {
-		h.Write([]byte(date))
-	}
-
-	// Read each part of the email
-	for {
-		p, err := msg.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return "", err
-		}
-
-		contentType := p.Header.Get("Content-Type")
-		switch {
-		case strings.HasPrefix(contentType, "text/plain"):
-			if content, err := io.ReadAll(p.Body); err == nil {
-				h.Write(content)
-			}
-		case strings.HasPrefix(contentType, "text/html"):
-			if content, err := io.ReadAll(p.Body); err == nil {
-				h.Write(content)
-			}
-		case strings.HasPrefix(contentType, "application/"):
-			// Include attachments in hash
-			if content, err := io.ReadAll(p.Body); err == nil {
-				h.Write(content)
-			}
-		}
-	}
-
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (im *IMAPManager) Close() {
@@ -147,12 +79,26 @@ func (im *IMAPManager) listMailboxes() ([]string, error) {
 
 	var boxes []string
 	for m := range mailboxes {
-		if !strings.EqualFold(m.Name, im.trashbox) {
+		// Si un dossier cible est spécifié, ne garder que ce dossier et ses sous-dossiers
+		if im.targetFolder != "" {
+			if strings.HasPrefix(m.Name, im.targetFolder) {
+				boxes = append(boxes, m.Name)
+			}
+		} else {
 			boxes = append(boxes, m.Name)
 		}
 	}
 
-	return boxes, <-done
+	if err := <-done; err != nil {
+		return nil, err
+	}
+
+	// Vérifier si on a trouvé des dossiers quand un targetFolder est spécifié
+	if im.targetFolder != "" && len(boxes) == 0 {
+		return nil, fmt.Errorf("no mailboxes found matching target folder: %s", im.targetFolder)
+	}
+
+	return boxes, nil
 }
 
 func (im *IMAPManager) scanMailbox(mailboxName string) ([]EmailInfo, error) {
@@ -164,11 +110,14 @@ func (im *IMAPManager) scanMailbox(mailboxName string) ([]EmailInfo, error) {
 	}
 
 	if mbox.Messages == 0 {
+		log.Printf("Mailbox %s is empty", mailboxName)
 		return nil, nil
 	}
 
+	log.Printf("Found %d messages in %s", mbox.Messages, mailboxName)
+
 	var emails []EmailInfo
-	batchSize := uint32(100)
+	batchSize := uint32(50)
 
 	for i := uint32(1); i <= mbox.Messages; i += batchSize {
 		from := i
@@ -183,42 +132,50 @@ func (im *IMAPManager) scanMailbox(mailboxName string) ([]EmailInfo, error) {
 		messages := make(chan *imap.Message, 10)
 		done := make(chan error, 1)
 
-		items := []imap.FetchItem{imap.FetchUid, imap.FetchEnvelope, imap.FetchBody, imap.FetchBodyStructure}
-
 		go func() {
-			done <- im.client.Fetch(seqSet, items, messages)
+			done <- im.client.Fetch(seqSet, []imap.FetchItem{imap.FetchRFC822, imap.FetchUid, imap.FetchEnvelope}, messages)
 		}()
 
 		for msg := range messages {
-			section := &imap.BodySectionName{}
-			r := msg.GetBody(section)
-			if r == nil {
+			if msg == nil {
+				log.Printf("Warning: nil message received")
 				continue
 			}
 
-			// Parse email
-			mr, err := mail.CreateReader(r)
-			if err != nil {
+			var msgData []byte
+			for _, r := range msg.Body {
+				if r == nil {
+					continue
+				}
+				buf := new(bytes.Buffer)
+				_, err := buf.ReadFrom(r)
+				if err != nil {
+					log.Printf("Warning: error reading message body: %v", err)
+					continue
+				}
+				msgData = buf.Bytes()
+				break
+			}
+
+			if len(msgData) == 0 {
+				log.Printf("Warning: empty message UID %d", msg.Uid)
 				continue
 			}
 
-			// Compute content-based hash
-			hash, err := computeEmailHash(mr)
-			if err != nil {
-				continue
-			}
+			hash := sha256.Sum256(msgData)
 
 			emailInfo := EmailInfo{
 				Mailbox: mailboxName,
 				Uid:     msg.Uid,
 				Subject: msg.Envelope.Subject,
 				Date:    msg.Envelope.Date,
-				Size:    msg.Size,
-				Hash:    hash,
+				Size:    uint32(len(msgData)),
+				Hash:    hex.EncodeToString(hash[:]),
+				Content: string(msgData[:100]),
 			}
 			emails = append(emails, emailInfo)
 
-			fmt.Printf("\rProcessed %d/%d in %s", len(emails), mbox.Messages, mailboxName)
+			fmt.Printf("\rProcessed UID %d in %s (%d bytes)", msg.Uid, mailboxName, len(msgData))
 		}
 
 		if err := <-done; err != nil {
@@ -226,32 +183,54 @@ func (im *IMAPManager) scanMailbox(mailboxName string) ([]EmailInfo, error) {
 		}
 	}
 
-	fmt.Println()
+	log.Printf("\nSuccessfully processed %d messages in %s", len(emails), mailboxName)
 	return emails, nil
 }
 
-func (im *IMAPManager) moveToTrash(email EmailInfo) error {
+func (im *IMAPManager) deleteEmail(email EmailInfo) error {
+	log.Printf("Deleting email [%s] UID %d...", email.Mailbox, email.Uid)
+
 	_, err := im.client.Select(email.Mailbox, false)
 	if err != nil {
-		return err
+		return fmt.Errorf("error selecting mailbox: %v", err)
 	}
 
 	seqSet := new(imap.SeqSet)
 	seqSet.AddNum(email.Uid)
 
-	return im.client.Move(seqSet, im.trashbox)
+	// Marquer le message comme supprimé
+	item := imap.FormatFlagsOp(imap.AddFlags, true)
+	flags := []interface{}{imap.DeletedFlag}
+	if err := im.client.UidStore(seqSet, item, flags, nil); err != nil {
+		return fmt.Errorf("error marking message as deleted: %v", err)
+	}
+
+	// Expurger le mailbox pour effectuer la suppression
+	if err := im.client.Expunge(nil); err != nil {
+		return fmt.Errorf("error expunging mailbox: %v", err)
+	}
+
+	log.Printf("Successfully deleted email [%s] UID %d", email.Mailbox, email.Uid)
+	return nil
 }
 
 func findDuplicates(emails []EmailInfo) []DuplicateGroup {
 	hashMap := make(map[string][]EmailInfo)
 
+	log.Printf("Analyzing %d emails for duplicates...", len(emails))
+
 	for _, email := range emails {
-		hashMap[email.Hash] = append(hashMap[email.Hash], email)
+		if email.Hash != "" {
+			hashMap[email.Hash] = append(hashMap[email.Hash], email)
+		}
 	}
 
 	var groups []DuplicateGroup
 	for hash, duplicates := range hashMap {
 		if len(duplicates) > 1 {
+			log.Printf("Found duplicate group with %d emails: %s",
+				len(duplicates),
+				duplicates[0].Subject)
 			groups = append(groups, DuplicateGroup{
 				Emails: duplicates,
 				Hash:   hash,
@@ -262,10 +241,11 @@ func findDuplicates(emails []EmailInfo) []DuplicateGroup {
 	return groups
 }
 
-func promptForChoice(group DuplicateGroup, dryRun bool) (int, error) {
-	fmt.Printf("\n=== Duplicate Group ===\n")
+func promptForChoice(group DuplicateGroup, currentGroup, totalGroups int, dryRun bool) (int, bool) {
+	fmt.Printf("\n=== Duplicate Group (%d/%d) ===\n", currentGroup, totalGroups)
 	fmt.Printf("Subject: %s\n", group.Emails[0].Subject)
 	fmt.Printf("Date: %s\n", group.Emails[0].Date.Format("2006-01-02 15:04:05"))
+	fmt.Printf("Content preview: %s\n", group.Emails[0].Content)
 	fmt.Printf("Found %d copies:\n\n", len(group.Emails))
 
 	for i, email := range group.Emails {
@@ -279,36 +259,39 @@ func promptForChoice(group DuplicateGroup, dryRun bool) (int, error) {
 	}
 
 	if dryRun {
-		return 0, nil
+		return 0, false
 	}
 
-	fmt.Printf("\nEnter number to keep (1-%d) or 's' to skip: ", len(group.Emails))
+	fmt.Printf("\nEnter number to keep (1-%d), 's' to skip, or 'q' to see summary: ", len(group.Emails))
 
 	reader := bufio.NewReader(os.Stdin)
 	input, err := reader.ReadString('\n')
 	if err != nil {
-		return -1, err
+		return -1, false
 	}
 
 	input = strings.TrimSpace(input)
+	if input == "q" || input == "Q" {
+		return -1, true
+	}
 	if input == "s" || input == "S" {
-		return -1, nil
+		return -1, false
 	}
 
 	choice, err := strconv.Atoi(input)
 	if err != nil || choice < 1 || choice > len(group.Emails) {
-		return -1, fmt.Errorf("invalid choice")
+		return -1, false
 	}
 
-	return choice - 1, nil
+	return choice - 1, false
 }
 
 func confirmActions(planned []EmailInfo) bool {
 	fmt.Printf("\n=== Summary of Actions ===\n")
-	fmt.Printf("Messages to move to trash: %d\n\n", len(planned))
+	fmt.Printf("Messages to delete: %d\n\n", len(planned))
 
 	for i, email := range planned {
-		fmt.Printf("%d) Move to trash: [%s] %s (%s)\n",
+		fmt.Printf("%d) Delete: [%s] %s (%s)\n",
 			i+1,
 			email.Mailbox,
 			email.Subject,
@@ -348,7 +331,9 @@ func main() {
 	}
 	defer imap.Close()
 
-	log.Printf("Using trash folder: %s", imap.trashbox)
+	if imap.targetFolder != "" {
+		log.Printf("Using target folder: %s", imap.targetFolder)
+	}
 
 	mailboxes, err := imap.listMailboxes()
 	if err != nil {
@@ -368,39 +353,35 @@ func main() {
 	duplicateGroups := findDuplicates(allEmails)
 	fmt.Printf("\nFound %d groups of duplicates\n", len(duplicateGroups))
 
-	var plannedMoves []EmailInfo
+	var plannedDeletes []EmailInfo
 
 	for i, group := range duplicateGroups {
-		fmt.Printf("\nProcessing group %d/%d\n", i+1, len(duplicateGroups))
-
-		choice, err := promptForChoice(group, *dryRun)
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			continue
+		choice, quit := promptForChoice(group, i+1, len(duplicateGroups), *dryRun)
+		if quit {
+			fmt.Println("\nJumping to summary...")
+			break
 		}
-
 		if choice == -1 {
 			fmt.Println("Skipping this group")
 			continue
 		}
 
-		// Add all emails except the chosen one to planned moves
 		for j, email := range group.Emails {
 			if j != choice {
-				plannedMoves = append(plannedMoves, email)
+				plannedDeletes = append(plannedDeletes, email)
 			}
 		}
 	}
 
-	if len(plannedMoves) == 0 {
+	if len(plannedDeletes) == 0 {
 		fmt.Println("\nNo actions to perform")
 		return
 	}
 
 	if *dryRun {
 		fmt.Println("\n=== Dry Run Summary ===")
-		for _, email := range plannedMoves {
-			fmt.Printf("Would move to trash: [%s] %s (%s)\n",
+		for _, email := range plannedDeletes {
+			fmt.Printf("Would delete: [%s] %s (%s)\n",
 				email.Mailbox,
 				email.Subject,
 				email.Date.Format("2006-01-02 15:04:05"),
@@ -409,16 +390,16 @@ func main() {
 		return
 	}
 
-	if !confirmActions(plannedMoves) {
+	if !confirmActions(plannedDeletes) {
 		fmt.Println("Operation cancelled")
 		return
 	}
 
-	fmt.Println("\nMoving messages to trash...")
-	for i, email := range plannedMoves {
-		fmt.Printf("\rProgress: %d/%d", i+1, len(plannedMoves))
-		if err := imap.moveToTrash(email); err != nil {
-			fmt.Printf("\nError moving message to trash: %v\n", err)
+	fmt.Println("\nDeleting messages...")
+	for i, email := range plannedDeletes {
+		fmt.Printf("\rProgress: %d/%d", i+1, len(plannedDeletes))
+		if err := imap.deleteEmail(email); err != nil {
+			fmt.Printf("\nError deleting message: %v\n", err)
 		}
 	}
 
