@@ -36,8 +36,9 @@ type DuplicateGroup struct {
 }
 
 type IMAPManager struct {
-    client      *client.Client
+    client       *client.Client
     targetFolder string
+    excludedFolders []string
 }
 
 func connectIMAP() (*IMAPManager, error) {
@@ -60,10 +61,30 @@ func connectIMAP() (*IMAPManager, error) {
     }
     log.Printf("Connected as %s", user)
 
+    excludedFolders := []string{
+        "trash", "corbeille", "deleted", "deleted messages",
+        "deleted items", "elements supprimes", "éléments supprimés",
+        "bin", "junk", "spam", "[gmail]/trash",
+        "[google mail]/trash", "[gmail]/corbeille",
+        "[gmail]/spam", "[gmail]/junk",
+    }
+
     return &IMAPManager{
         client: c,
         targetFolder: targetFolder,
+        excludedFolders: excludedFolders,
     }, nil
+}
+
+func (im *IMAPManager) isExcludedFolder(name string) bool {
+    nameLower := strings.ToLower(name)
+    for _, excluded := range im.excludedFolders {
+        if strings.Contains(nameLower, excluded) {
+            log.Printf("Excluding folder: %s", name)
+            return true
+        }
+    }
+    return false
 }
 
 func (im *IMAPManager) Close() {
@@ -79,6 +100,12 @@ func (im *IMAPManager) listMailboxes() ([]string, error) {
 
     var boxes []string
     for m := range mailboxes {
+        // Ignore les dossiers exclus
+        if im.isExcludedFolder(m.Name) {
+            continue
+        }
+
+        // Filtre selon targetFolder si défini
         if im.targetFolder != "" {
             if strings.HasPrefix(m.Name, im.targetFolder) {
                 boxes = append(boxes, m.Name)
@@ -96,6 +123,7 @@ func (im *IMAPManager) listMailboxes() ([]string, error) {
         return nil, fmt.Errorf("no mailboxes found matching target folder: %s", im.targetFolder)
     }
 
+    log.Printf("Found %d mailboxes to analyze (excluding trash/spam folders)", len(boxes))
     return boxes, nil
 }
 
