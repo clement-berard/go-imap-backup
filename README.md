@@ -110,6 +110,35 @@ Use the `TARGET_FOLDER` environment variable to focus on a specific folder:
 TARGET_FOLDER=Work/Project
 ```
 
+### Folder Deletion
+
+Full deletion of a folder and all its subfolders with content.
+
+```bash
+# Interactive mode with details prompt
+./go-imap-backup-[your-platform] delete "Work/Project"
+
+# Dry run mode
+./go-imap-backup-[your-platform] delete --dry-run "Work/Project"
+```
+
+#### Features
+
+- Deep deletion of folders and subfolders
+- Safe ordering (deletes subfolders before parent folders)
+- Detailed preview of all messages in dry-run mode
+- Confirmation prompt with full impact summary
+- Automatic reconnection on connection loss
+- Progress tracking and error handling
+
+#### Safety Features for Folder Deletion
+
+- Confirmation required with total count of affected messages
+- Optional detailed message list in dry-run mode
+- Safe interruption with CTRL+C
+- Connection recovery in case of timeout
+- Multiple deletion attempts with automatic reconnection
+
 ## How Duplicate Detection Works
 
 1. **Content Hash**: Creates a SHA-256 hash of each email's content
@@ -129,6 +158,8 @@ TARGET_FOLDER=Work/Project
 - Safe interruption handling
 - Error logging
 - Progress tracking
+- Deep deletion order (children before parents)
+- Automatic reconnection on IMAP timeout
 
 ## Important Notes
 
